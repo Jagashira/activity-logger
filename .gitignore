@@ -31,3 +31,10 @@ Thumbs.db
 activity_log.txt
 .env
 *.html
+build/
+dist/
+*.spec
+*.egg-info/
+*.egg
+temp.iconset/
+asset/icon.icns
