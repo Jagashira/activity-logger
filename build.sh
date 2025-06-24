@@ -22,31 +22,33 @@ if [ ! -f "logger.spec" ]; then
     # pyi-makespecは不完全なファイルを生成するため、
     # 既知の正しい設定を直接書き込みます。
     cat > logger.spec << EOF
-# logger.spec (自動生成)
 # -*- mode: python ; coding: utf-8 -*-
 
 
+# --- ステップ1: スクリプトと依存関係の解析 ---
 a = Analysis(
-    ['./scripts/logger.py'],
+    ['scripts/logger.py'],
     pathex=[],
     binaries=[],
-    datas=[],
-    hiddenimports=[],
+    datas=[('asset/icon.svg', 'asset')],
+    hiddenimports=['objc', 'sqlite3', 'pyminizip'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
     excludes=[],
-    noarchive=False,
-    optimize=0,
+    cipher=None,
 )
+
+# --- ステップ2: Pythonライブラリの圧縮 ---
 pyz = PYZ(a.pure)
 
+# --- ステップ3: 実行ファイルの作成 ---
 exe = EXE(
     pyz,
     a.scripts,
     [],
     exclude_binaries=True,
-    name='logger',
+    name='ActivityLogger',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -58,21 +60,32 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
 )
+
+# --- ステップ4: 全てのファイルをまとめる ---
 coll = COLLECT(
     exe,
     a.binaries,
     a.datas,
+    a.zipfiles,
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='logger',
+    name='ActivityLogger',
 )
+
+# --- ステップ5: .appバンドルの作成 ---
 app = BUNDLE(
     coll,
-    name='logger.app',
-    icon=None,
+    name='ActivityLogger.app',
+    icon='asset/icon.icns',
     bundle_identifier=None,
+    info_plist={
+        'NSPrincipalClass': 'NSApplication',
+        'NSAppleScriptEnabled': False,
+        'LSUIElement': '1'  # Dockにアイコンを表示しない設定
+    },
 )
+
 
 EOF
     echo "logger.spec を作成しました。"
