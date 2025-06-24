@@ -6,6 +6,10 @@ import sys
 from typing import List
 import os
 import time
+import sqlite3
+# --- NEW: Webブラウザと外部コマンド実行のためにインポート ---
+import webbrowser
+import subprocess
 
 import pyminizip
 import objc
@@ -55,33 +59,44 @@ from PyQt5.QtWidgets import (
     QAction,
     QMenu,
 )
-# --- MODIFIED: SVG関連のモジュールをインポート ---
 from PyQt5.QtGui import QIcon, QPixmap, QPainter, QColor
 from PyQt5.QtCore import QTimer, pyqtSignal, Qt, QByteArray
 from PyQt5.QtSvg import QSvgRenderer
 
-# (グローバル変数とコールバック関数、AppObserver, EventTapManager, AppWindow のコードは変更なしなので省略)
-# (For brevity, the unchanged classes AppObserver, EventTapManager, and AppWindow are omitted here.)
+# (DatabaseManager, AppObserver, EventTapManager, flush_buffer, keyboard_cb, create_icon_from_svg のコードは変更なしなので省略)
+# (For brevity, the unchanged classes and functions are omitted here.)
+class DatabaseManager:
+    def __init__(self, db_path):
+        self.db_path = db_path; os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        self.conn = sqlite3.connect(db_path); self.cursor = self.conn.cursor(); self._setup_table()
+    def _setup_table(self):
+        self.cursor.execute('CREATE TABLE IF NOT EXISTS logs (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL, event_type TEXT NOT NULL, content TEXT)'); self.conn.commit()
+    def add_log_entry(self, event_type: str, content: str = ''):
+        timestamp = _dt.datetime.now().isoformat()
+        try:
+            self.cursor.execute("INSERT INTO logs (timestamp, event_type, content) VALUES (?, ?, ?)", (timestamp, event_type, content)); self.conn.commit()
+        except sqlite3.Error as e: print(f"Database error: {e}")
+    def close(self):
+        if self.conn: self.conn.close()
 _buffer: List[str] = []
 window: AppWindow = None
 def flush_buffer() -> None:
     if not (_buffer and window): return
-    if window.just_switched_app:
-        log_text = f"\n\u3000{''.join(_buffer)}"
-        window.just_switched_app = False
-    else: log_text = ''.join(_buffer)
-    window.update_log(log_text); _buffer.clear()
+    text_chunk = ''.join(_buffer); window.db_manager.add_log_entry('KEYSTROKE', text_chunk)
+    if window.just_switched_app: log_text = f"\n\u3000{text_chunk}"; window.just_switched_app = False
+    else: log_text = text_chunk
+    window.update_gui_log(log_text); _buffer.clear()
 def keyboard_cb(proxy, etype, event, refcon):
     if etype != kCGEventKeyDown: return event
     _, text = CGEventKeyboardGetUnicodeString(event, 1, None, None)
     keycode = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode)
     if keycode in (36, 76, 52):
         flush_buffer()
-        if window: window.update_log("\n")
+        if window: window.db_manager.add_log_entry('KEYSTROKE', '[ENTER]'); window.update_gui_log("\n")
     elif keycode == 51:
         if _buffer: _buffer.pop()
         else:
-            if window: window.update_log("[<-]")
+            if window: window.db_manager.add_log_entry('KEYSTROKE', '[BACKSPACE]'); window.update_gui_log("[<-]")
     elif keycode == 49: _buffer.append(" ")
     else:
         if text and text.isprintable(): _buffer.append(text)
@@ -93,8 +108,8 @@ class AppObserver(NSObject):
         if app != self._current:
             self._current = app; stamp = _dt.datetime.now().strftime("%H:%M:%S"); flush_buffer()
             if window:
-                window.update_log(f"\n🗂️  APP  {app}  ({stamp})")
-                window.just_switched_app = True
+                window.db_manager.add_log_entry('APP_SWITCH', app)
+                window.update_gui_log(f"\n🗂️  APP  {app}  ({stamp})"); window.just_switched_app = True
     def start(self):
         nc = NSWorkspace.sharedWorkspace().notificationCenter()
         nc.addObserver_selector_name_object_(self, objc.selector(self.didActivateApp_, signature=b"v@:@"), NSWorkspaceDidActivateApplicationNotification, None)
@@ -122,117 +137,89 @@ class EventTapManager:
         if self.is_running() and not self.is_paused: CGEventTapEnable(self.event_tap, False); self.is_paused = True
     def resume(self):
         if self.is_running() and self.is_paused: CGEventTapEnable(self.event_tap, True); self.is_paused = False
+
 class AppWindow(QMainWindow):
     logging_status_changed = pyqtSignal(bool, bool, str)
     def __init__(self):
         super().__init__()
-        self.autosave_dir = os.path.join(os.path.expanduser('~'),"logs"); self.autosave_filepath = None; self.max_log_size_bytes = 0; self.current_log_file = None; self.just_switched_app = False
-        self.setWindowTitle('Activity Logger'); self.setGeometry(100, 100, 700, 550); self.text_edit = QTextEdit(self); self.text_edit.setReadOnly(True)
-        self.toggle_button = QPushButton('Start Logging', self); self.clear_button = QPushButton('Clear Log', self); self.save_button = QPushButton('Save Log Now', self); self.zip_button = QPushButton('Save & Zip Log Now', self)
-        button_layout = QHBoxLayout(); button_layout.addWidget(self.toggle_button); button_layout.addWidget(self.clear_button); button_layout.addStretch(1); button_layout.addWidget(self.save_button); button_layout.addWidget(self.zip_button)
-        autosave_layout = QHBoxLayout(); self.autosave_checkbox = QCheckBox("Auto-save log", self); self.autosave_checkbox.setChecked(True); autosave_layout.addWidget(self.autosave_checkbox)
-        autosave_layout.addWidget(QLabel("Max Size (KB):", self)); self.autosave_size_spinbox = QSpinBox(self); self.autosave_size_spinbox.setRange(100, 10000); self.autosave_size_spinbox.setValue(1024)
-        autosave_layout.addWidget(self.autosave_size_spinbox); autosave_layout.addStretch(1); main_layout = QVBoxLayout(); main_layout.addWidget(self.text_edit); main_layout.addLayout(button_layout); main_layout.addLayout(autosave_layout)
+        self.just_switched_app = False
+        db_storage_path = os.path.join(os.path.expanduser('~'), ".activity-logger")
+        self.db_manager = DatabaseManager(os.path.join(db_storage_path, "activity.db"))
+        self.setWindowTitle('Activity Logger'); self.setGeometry(100, 100, 700, 500); self.text_edit = QTextEdit(self); self.text_edit.setReadOnly(True)
+        self.toggle_button = QPushButton('Start Logging', self); self.clear_button = QPushButton('Clear Log', self)
+        button_layout = QHBoxLayout(); button_layout.addWidget(self.toggle_button); button_layout.addWidget(self.clear_button); button_layout.addStretch(1)
+        main_layout = QVBoxLayout(); main_layout.addWidget(self.text_edit); main_layout.addLayout(button_layout)
         container = QWidget(); container.setLayout(main_layout); self.setCentralWidget(container)
         self.statusBar = QStatusBar(self); self.setStatusBar(self.statusBar)
         self.event_manager = EventTapManager()
-        self.update_status("Ready. Start logging from the menu bar icon or this window.")
-        self.toggle_button.clicked.connect(self.toggle_logging); self.save_button.clicked.connect(self.save_log_file); self.zip_button.clicked.connect(self.save_zip_file); self.clear_button.clicked.connect(self.text_edit.clear)
-    def rotate_log_file(self):
-        if self.current_log_file: self.current_log_file.close()
-        start_time = _dt.datetime.now().strftime("%Y%m%d_%H%M%S"); filename = f"auto_log_{start_time}.txt"; self.autosave_filepath = os.path.join(self.autosave_dir, filename)
-        try:
-            self.current_log_file = open(self.autosave_filepath, 'a', encoding='utf-8')
-            status_msg = f"Logging to new file: {filename}"; self.update_status(status_msg); self.logging_status_changed.emit(True, False, status_msg)
-        except Exception as e: self.update_status(f"Error opening new log file: {e}"); self.current_log_file = None
+        self.update_status("Ready. Start logging from the menu bar icon.")
+        self.toggle_button.clicked.connect(self.toggle_logging); self.clear_button.clicked.connect(self.text_edit.clear)
+
     def start_logging(self):
         self.just_switched_app = False
-        if self.autosave_checkbox.isChecked():
-            try: os.makedirs(self.autosave_dir, exist_ok=True)
-            except OSError as e: QMessageBox.critical(self, "Auto-save Error", f"Could not create directory:\n{self.autosave_dir}\n\nError: {e}"); return
-            self.max_log_size_bytes = self.autosave_size_spinbox.value() * 1024; self.rotate_log_file()
         if self.event_manager.start():
-            self.update_log("🟢 Logging started...\n"); status_msg = "Status: Logging Active"; self.update_status(status_msg)
-            self.toggle_button.setText("Stop Logging"); self.set_settings_enabled(False); self.logging_status_changed.emit(True, False, status_msg)
-        else: self.update_log("❌ FAILED TO CREATE EVENT TAP...\n")
+            log_message = "🟢 Logging started..."; self.db_manager.add_log_entry('SYSTEM', 'START'); self.update_gui_log(f"{log_message}\n")
+            status_msg = "Status: Logging Active"; self.update_status(status_msg); self.toggle_button.setText("Stop Logging")
+            self.logging_status_changed.emit(True, False, status_msg)
+        else: self.update_gui_log("❌ FAILED TO CREATE EVENT TAP...\n")
+            
     def stop_logging(self):
-        if self.current_log_file:
-            self.current_log_file.close(); self.current_log_file = None; status_msg = "Final log saved. Status: Idle."
-        else: status_msg = "Status: Idle"
-        self.autosave_filepath = None; flush_buffer(); self.event_manager.stop(); self.update_log("\n⏹ Logging stopped.\n"); self.update_status(status_msg)
-        self.toggle_button.setText("Start Logging"); self.set_settings_enabled(True); self.logging_status_changed.emit(False, False, status_msg)
+        flush_buffer(); self.event_manager.stop()
+        log_message = "⏹ Logging stopped."; self.db_manager.add_log_entry('SYSTEM', 'STOP'); self.update_gui_log(f"\n{log_message}\n")
+        status_msg = "Status: Idle"; self.update_status(status_msg); self.toggle_button.setText("Start Logging")
+        self.logging_status_changed.emit(False, False, status_msg)
+
     def toggle_pause(self):
         if not self.event_manager.is_running(): return
         if self.event_manager.is_paused:
-            self.event_manager.resume(); self.update_log("\n▶️ Logging resumed.\n"); status_msg = "Status: Logging Active"; self.update_status(status_msg)
-            self.logging_status_changed.emit(True, False, status_msg)
+            self.event_manager.resume(); log_message = "▶️ Logging resumed."; event = "RESUME"; is_paused = False; status_msg = "Status: Logging Active"
         else:
-            self.event_manager.pause(); self.update_log("\n⏸️ Logging paused.\n"); status_msg = "Status: Paused"; self.update_status(status_msg)
-            self.logging_status_changed.emit(True, True, status_msg)
-    def set_settings_enabled(self, enabled: bool): self.autosave_checkbox.setEnabled(enabled); self.autosave_size_spinbox.setEnabled(enabled); self.save_button.setEnabled(enabled); self.zip_button.setEnabled(enabled); self.clear_button.setEnabled(enabled)
+            self.event_manager.pause(); log_message = "⏸️ Logging paused."; event = "PAUSE"; is_paused = True; status_msg = "Status: Paused"
+        self.db_manager.add_log_entry('SYSTEM', event); self.update_gui_log(f"\n{log_message}\n"); self.update_status(status_msg)
+        self.logging_status_changed.emit(True, is_paused, status_msg)
+
     def toggle_logging(self):
         if self.event_manager.is_running(): self.stop_logging()
         else: self.start_logging()
-    def closeEvent(self, event): self.hide(); event.ignore()
-    def update_status(self, message: str): self.statusBar.showMessage(message)
-    def update_log(self, log_text: str):
-        self.text_edit.moveCursor(self.text_edit.textCursor().End); self.text_edit.insertPlainText(log_text); print(log_text, end='', flush=True)
-        if self.autosave_checkbox.isChecked() and self.current_log_file:
-            try:
-                self.current_log_file.write(log_text); self.current_log_file.flush()
-                if os.path.getsize(self.autosave_filepath) > self.max_log_size_bytes: self.rotate_log_file()
-            except Exception as e: self.update_status(f"Error writing to log file: {e}")
-    def save_log_file(self):
-        log_content = self.text_edit.toPlainText();
-        if not log_content: self.update_status("Log is empty. Nothing to save."); return
-        default_filename = f"manual_save_{_dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"; path, _ = QFileDialog.getSaveFileName(self, "Save Log File", default_filename, "Text Files (*.txt);;All Files (*)")
-        if path:
-            try:
-                with open(path, 'w', encoding='utf-8') as f: f.write(log_content)
-                self.update_status(f"Log saved to {os.path.basename(path)}")
-            except Exception as e: self.update_status(f"Error saving file: {e}")
-    def save_zip_file(self):
-        log_content = self.text_edit.toPlainText();
-        if not log_content: self.update_status("Log is empty. Nothing to save."); return
-        password, ok = QInputDialog.getText(self, "Set Zip Password", "Enter a password for the archive:", QLineEdit.Password)
-        if not (ok and password): self.update_status("Zip save cancelled. Password is required."); return
-        default_filename = f"manual_save_{_dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"; zip_path, _ = QFileDialog.getSaveFileName(self, "Save Zipped Log File", default_filename, "Zip Archives (*.zip)")
-        if zip_path:
-            temp_txt_file = "temp_log_for_zip.txt"
-            try:
-                with open(temp_txt_file, "w", encoding='utf-8') as f: f.write(log_content)
-                pyminizip.compress(temp_txt_file, None, zip_path, password, 9)
-                self.update_status(f"Log zipped and saved to {os.path.basename(zip_path)}")
-            except Exception as e: self.update_status(f"Error creating zip file: {e}")
-            finally:
-                if os.path.exists(temp_txt_file): os.remove(temp_txt_file)
 
-# --- NEW: SVGデータを読み込み、色付けしてアイコンを生成するヘルパー関数 ---
+    # --- NEW: データベースビューアを開くメソッド ---
+    def open_database_viewer(self):
+        db_viewer_app = "DB Browser for SQLite.app"
+        db_viewer_path = os.path.join("/Applications", db_viewer_app)
+        download_url = "https://sqlitebrowser.org/dl/"
+        db_file_path = self.db_manager.db_path
+
+        if os.path.exists(db_viewer_path):
+            # アプリがインストールされている場合
+            try:
+                self.update_gui_log(f"\nOpening {os.path.basename(db_file_path)} in {db_viewer_app}...")
+                subprocess.run(["open", "-a", db_viewer_path, db_file_path], check=True)
+            except (subprocess.CalledProcessError, FileNotFoundError) as e:
+                self.update_gui_log(f"\nFailed to open database viewer: {e}")
+                QMessageBox.critical(self, "Error", f"Could not open the database viewer application at:\n{db_viewer_path}")
+        else:
+            # アプリがインストールされていない場合
+            reply = QMessageBox.question(self, "DB Viewer Not Found",
+                                         f"To view the database, '{db_viewer_app}' is recommended.\n\n"
+                                         "Would you like to open the download page?",
+                                         QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply == QMessageBox.Yes:
+                webbrowser.open(download_url)
+                
+    def closeEvent(self, event):
+        self.hide(); event.ignore()
+        
+    def update_status(self, message: str): self.statusBar.showMessage(message)
+        
+    def update_gui_log(self, log_text: str):
+        self.text_edit.moveCursor(self.text_edit.textCursor().End); self.text_edit.insertPlainText(log_text); print(log_text, end='', flush=True)
+
 def create_icon_from_svg(svg_template: str, color: str, size: int = 32) -> QIcon:
-    """
-    SVGテンプレートのテキストを読み込み、特定の色で描画したQIconを生成する。
-    """
-    # 色のプレースホルダーを置換
-    svg_data = svg_template.replace('#000000', color)
-    
-    # SVGデータをバイト配列に変換
-    svg_bytes = QByteArray(svg_data.encode('utf-8'))
-    
-    # SVGレンダラーを作成
-    renderer = QSvgRenderer(svg_bytes)
-    
-    # 描画先のPixmapを作成
-    pixmap = QPixmap(size, size)
-    pixmap.fill(Qt.transparent) # 背景を透明にする
-    
-    # PixmapにSVGを描画
-    painter = QPainter(pixmap)
-    renderer.render(painter)
-    painter.end()
-    
+    svg_data = svg_template.replace('#000000', color); svg_bytes = QByteArray(svg_data.encode('utf-8'))
+    renderer = QSvgRenderer(svg_bytes); pixmap = QPixmap(size, size); pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap); renderer.render(painter); painter.end()
     return QIcon(pixmap)
 
-# --- Main ---
 def main() -> None:
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
@@ -240,44 +227,44 @@ def main() -> None:
     window = AppWindow()
     
     if not QSystemTrayIcon.isSystemTrayAvailable():
-        QMessageBox.critical(None, "Systray", "I couldn't detect any system tray on this system.")
-        sys.exit(1)
+        QMessageBox.critical(None, "Systray", "I couldn't detect any system tray on this system."); sys.exit(1)
 
-    # --- MODIFIED: SVGベースのアイコン生成ロジック ---
+    app.aboutToQuit.connect(window.db_manager.close)
+    
     try:
-        script_path = os.path.abspath(__file__)
-        script_dir = os.path.dirname(script_path)
-        project_root = os.path.dirname(script_dir)
+        script_path = os.path.abspath(__file__); script_dir = os.path.dirname(script_path); project_root = os.path.dirname(script_dir)
         ICON_PATH = os.path.join(project_root, 'asset', 'icon.svg')
-
-        if not os.path.exists(ICON_PATH):
-            raise FileNotFoundError(f"Icon not found at specified path: {ICON_PATH}")
-
-        # SVGファイルを一度だけ読み込む
-        with open(ICON_PATH, 'r', encoding='utf-8') as f:
-            svg_template_string = f.read()
-
-        COLOR_ACTIVE = "#007AFF"
-        COLOR_INACTIVE = "#8E8E93"
-        
-        # テンプレートから色付きのアイコンを生成
-        icon_active = create_icon_from_svg(svg_template_string, COLOR_ACTIVE)
-        icon_inactive = create_icon_from_svg(svg_template_string, COLOR_INACTIVE)
-        
+        if not os.path.exists(ICON_PATH): raise FileNotFoundError(f"Icon not found at specified path: {ICON_PATH}")
+        with open(ICON_PATH, 'r', encoding='utf-8') as f: svg_template_string = f.read()
+        COLOR_ACTIVE = "#007AFF"; COLOR_INACTIVE = "#8E8E93"
+        icon_active = create_icon_from_svg(svg_template_string, COLOR_ACTIVE); icon_inactive = create_icon_from_svg(svg_template_string, COLOR_INACTIVE)
     except Exception as e:
-        print(f"Error setting up icons: {e}")
-        QMessageBox.warning(None, "Icon Error", f"Could not load icon.\n\nError: {e}")
+        print(f"Error setting up icons: {e}"); QMessageBox.warning(None, "Icon Error", f"Could not load icon.\n\nError: {e}")
         icon_active, icon_inactive = QIcon(), QIcon()
         
-    tray_icon = QSystemTrayIcon(icon_inactive, parent=app)
-    tray_icon.setToolTip("Activity Logger")
+    tray_icon = QSystemTrayIcon(icon_inactive, parent=app); tray_icon.setToolTip("Activity Logger")
     
-    menu = QMenu(); status_action = QAction("ステータス: 停止中", menu); status_action.setEnabled(False)
+    # --- MODIFIED: 新しいメニュー項目を追加 ---
+    menu = QMenu()
+    status_action = QAction("ステータス: 停止中", menu); status_action.setEnabled(False)
     toggle_log_action = QAction("ロギング開始", menu); toggle_log_action.triggered.connect(window.toggle_logging)
     pause_action = QAction("一時停止", menu); pause_action.triggered.connect(window.toggle_pause); pause_action.setEnabled(False)
+    
+    menu.addAction(status_action); menu.addSeparator(); menu.addAction(toggle_log_action); menu.addAction(pause_action)
+    
+    # --- NEW: データベースを開くアクションを追加 ---
+    menu.addSeparator()
+    view_db_action = QAction("データベースを開く...", menu)
+    view_db_action.triggered.connect(window.open_database_viewer)
+    menu.addAction(view_db_action)
+    
     show_action = QAction("ウィンドウを表示/隠す", menu); show_action.triggered.connect(lambda: window.show() if window.isHidden() else window.hide())
+    menu.addAction(show_action)
+    
+    menu.addSeparator()
     quit_action = QAction("終了", menu); quit_action.triggered.connect(app.quit)
-    menu.addAction(status_action); menu.addSeparator(); menu.addAction(toggle_log_action); menu.addAction(pause_action); menu.addAction(show_action); menu.addSeparator(); menu.addAction(quit_action)
+    menu.addAction(quit_action)
+    
     tray_icon.setContextMenu(menu); tray_icon.show()
     
     def update_tray_menu(is_logging, is_paused, status_message):
