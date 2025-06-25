@@ -20,11 +20,11 @@ if [ ! -f "logger.spec" ]; then
 
 # --- ステップ1: スクリプトと依存関係の解析 ---
 a = Analysis(
-    ['scripts/logger.py'],
+    ['app/main.py'],
     pathex=[],
     binaries=[],
     datas=[('asset/icon.svg', 'asset')],
-    hiddenimports=['objc', 'sqlite3', 'pyminizip'],
+    hiddenimports=['objc', 'sqlite3', 'pyminizip','PyQt5.QtWebEngineWidgets'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
