@@ -1,29 +1,22 @@
 #!/bin/bash
 
-# このスクリプトは、macOSアプリケーションのビルドプロセスを自動化します。
-# エラーが発生した時点でスクリプトを停止するように設定します。
-set -e
-
 echo "------------------------------------"
 echo "ビルドプロセスを開始します..."
 echo "------------------------------------"
 
-# ステップ1: 古いビルドファイルをクリーンアップ
+
 echo "[1/4] 古いビルドファイル (build/, dist/) を削除しています..."
 rm -rf build/
 rm -rf dist/
 echo "クリーンアップ完了。"
 echo ""
 
-# ステップ2: logger.spec ファイルの確認と生成
+
 echo "[2/4] logger.spec ファイルを確認しています..."
 if [ ! -f "logger.spec" ]; then
     echo "logger.spec が見つかりません。正しい内容で新規作成します..."
-    # pyi-makespecは不完全なファイルを生成するため、
-    # 既知の正しい設定を直接書き込みます。
     cat > logger.spec << EOF
 # -*- mode: python ; coding: utf-8 -*-
-
 
 # --- ステップ1: スクリプトと依存関係の解析 ---
 a = Analysis(
@@ -82,7 +75,7 @@ app = BUNDLE(
     info_plist={
         'NSPrincipalClass': 'NSApplication',
         'NSAppleScriptEnabled': False,
-        'LSUIElement': '1'  # Dockにアイコンを表示しない設定
+        'LSUIElement': '1'
     },
 )
 
@@ -94,7 +87,7 @@ else
 fi
 echo ""
 
-# ステップ3: アプリアイコン (.icns) を作成
+
 CREATE_ICON_SCRIPT="scripts/create_icon.py"
 if [ ! -f "$CREATE_ICON_SCRIPT" ]; then
     echo "エラー: $CREATE_ICON_SCRIPT が見つかりません。アイコンを生成できません。"
@@ -105,7 +98,7 @@ python "$CREATE_ICON_SCRIPT"
 echo "アイコン生成完了。"
 echo ""
 
-# ステップ4: PyInstallerでアプリケーションをビルド
+
 echo "[4/4] PyInstallerでアプリケーションをビルドしています..."
 python -m PyInstaller logger.spec
 
